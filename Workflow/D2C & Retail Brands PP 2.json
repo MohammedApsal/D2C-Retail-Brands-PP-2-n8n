@@ -1,0 +1,3665 @@
+{
+  "name": "D2C & Retail Brands PP 2",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## WF-2 — Shipment Status Sync\nAutonomous background polling engine. Features durable row lease claiming to prevent concurrent execution collisions. Only significant delivery milestones trigger proactive WhatsApp alerts. Intermediate hub scans update the database quietly.\n\nNOTE ON EXTERNAL DELIVERY GUARANTEES:\nMeta WhatsApp API does not offer a two-phase atomic commit with PostgreSQL. There is an inherent edge window where a message is accepted by Meta, but a sudden system crash occurs before PostgreSQL records status='sent'. We minimize this risk via deterministic notification keys, lease ownership, and immediate status updates, achieving robust at-least-once delivery semantics.",
+        "height": 220,
+        "width": 640,
+        "color": 6
+      },
+      "id": "695a8e62-0049-422e-9825-a64b264e64a1",
+      "name": "Sync Engine Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -480,
+        -144
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "d994cfcf-da63-4cb8-ac5f-4e0fa2285aa9",
+      "name": "Schedule Trigger (15 min)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -432,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH eligible AS (\n  SELECT s.id\n  FROM wismo.shipments s\n  WHERE (s.normalized_status IS NULL OR s.normalized_status NOT IN ('delivered', 'rto', 'lost', 'cancelled'))\n    AND (s.last_synced_at IS NULL OR s.last_synced_at < NOW() - INTERVAL '15 minutes')\n    AND (s.lease_until IS NULL OR s.lease_until < NOW())\n    AND NULLIF(BTRIM(s.tracking_number), '') IS NOT NULL\n  ORDER BY s.last_synced_at ASC NULLS FIRST\n  LIMIT 50\n  FOR UPDATE SKIP LOCKED\n),\nclaimed AS (\n  UPDATE wismo.shipments s\n  SET lease_token = gen_random_uuid()::text,\n      lease_until = NOW() + INTERVAL '10 minutes',\n      sync_attempts = COALESCE(s.sync_attempts, 0) + 1\n  FROM eligible\n  WHERE s.id = eligible.id\n  RETURNING s.*\n)\nSELECT claimed.*, o.order_number, o.customer_id\nFROM claimed\nJOIN wismo.orders o ON o.id = claimed.order_id;",
+        "options": {}
+      },
+      "id": "552d94be-27bf-44fe-a062-1e1233dc558f",
+      "name": "Claim Active Shipments Batch",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -224,
+        224
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "2bbef02e-8815-4559-9358-d030f6a689b3",
+      "name": "Loop Over Shipments",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        0,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $json;\nreturn {\n  json: {\n    ...s,\n    courier: (s.courier || 'unknown').toLowerCase().trim(),\n    prev_normalized_status: s.normalized_status || null,\n    prev_raw_status: s.raw_status || null,\n    prev_current_location: s.current_location || null,\n    prev_estimated_delivery: s.estimated_delivery ? String(s.estimated_delivery).split('T')[0] : null,\n    prev_tracking_url: s.tracking_url || null\n  }\n};"
+      },
+      "id": "0b9b3f7c-f63a-4c3b-9f64-9ca03cb98c50",
+      "name": "Determine Courier",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.courier }}",
+                    "rightValue": "shiprocket",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.courier }}",
+                    "rightValue": "delhivery",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "0272f53d-46f6-4eb4-b5ac-3382454e3b4c",
+      "name": "Courier Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        448,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://apiv2.shiprocket.in/v1/external/courier/track/awb/{{ $json.tracking_number }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SHIPROCKET_JWT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "36f01f45-cfa7-4141-81fb-6d8328e7d6d9",
+      "name": "Shiprocket Adapter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        656,
+        32
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://track.delhivery.com/api/v1/packages/json/?token={{ $env.DELHIVERY_AUTH_TOKEN }}&waybill={{ $json.tracking_number }}&verbose=2",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "aee64d98-3405-4085-a3a4-75169cb87172",
+      "name": "Delhivery Adapter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        656,
+        192
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $json;\nreturn { json: { id: s.id, lease_token: s.lease_token, courier: s.courier } };"
+      },
+      "id": "a6230f4d-fa7b-4a60-a756-6f5cf2d50803",
+      "name": "Unsupported Courier Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.shipments\nSET lease_token = NULL, lease_until = NULL, last_synced_at = NOW()\nWHERE id = $1 AND lease_token = $2;\n\nINSERT INTO wismo.shipment_events (shipment_id, status, occurred_at, raw_payload)\nVALUES ($1, 'unsupported_courier', NOW(), $3::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.lease_token, JSON.stringify({ courier: $json.courier })] }}"
+        }
+      },
+      "id": "a9e180a1-b43f-4742-b99e-f8cecd472b99",
+      "name": "Log Unsupported Courier & Release Lease",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        896,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.shipments\nSET lease_token = NULL, lease_until = NULL, last_synced_at = NOW()\nWHERE id = $1 AND lease_token = $2;\n\nINSERT INTO wismo.shipment_events (shipment_id, status, occurred_at, raw_payload)\nVALUES ($1, 'sync_error', NOW(), $3::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [$('Determine Courier').item.json.id, $('Determine Courier').item.json.lease_token, JSON.stringify($json)] }}"
+        }
+      },
+      "id": "0c3163d9-1036-4194-8277-f3cd72a87932",
+      "name": "Record Courier Sync Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        896,
+        32
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Determine Courier').item.json;\nconst map = {\n  '6': 'in_transit', '7': 'in_transit', '8': 'out_for_delivery',\n  '9': 'delivered', '10': 'delivery_exception', '11': 'delivery_exception',\n  '17': 'rto', '18': 'rto', 'SHIPPED': 'in_transit', 'DELIVERED': 'delivered'\n};\n\nconst track = $json.tracking_data?.shipment_track?.[0] || {};\nconst rawCode = String(track.current_status_code || track.current_status || '').trim();\nconst mapped = rawCode ? (map[rawCode] || 'unknown') : 'unknown';\nconst normalized = mapped !== 'unknown' ? mapped : (prev.prev_normalized_status || 'unknown');\n\nconst lastScan = track.scans?.slice(-1)[0]?.location || prev.prev_current_location || null;\nconst edd = track.edd ? String(track.edd).split(' ')[0] : prev.prev_estimated_delivery || null;\nconst verifiedUrl = track.tracking_url || prev.prev_tracking_url || null;\n\nreturn {\n  json: {\n    ...prev,\n    new_status: normalized,\n    raw_status: track.current_status || prev.prev_raw_status || 'UNKNOWN',\n    new_location: lastScan,\n    new_eta: edd,\n    tracking_url: verifiedUrl,\n    raw_payload: $json\n  }\n};"
+      },
+      "id": "130915df-d1ea-4503-a43d-63eb1425ceb7",
+      "name": "Normalize Shiprocket Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Determine Courier').item.json;\nconst map = {\n  'in transit': 'in_transit', 'dispatched': 'in_transit', 'out for delivery': 'out_for_delivery',\n  'delivered': 'delivered', 'pending': 'delivery_exception', 'failed': 'delivery_exception',\n  'consignee unreached': 'delivery_exception', 'rto': 'rto', 'returned': 'rto'\n};\n\nconst pkg = $json.ShipmentData?.[0]?.Shipment || {};\nconst rawStatus = (pkg.Status?.Status || '').toLowerCase().trim();\nconst mapped = rawStatus ? (map[rawStatus] || 'unknown') : 'unknown';\nconst normalized = mapped !== 'unknown' ? mapped : (prev.prev_normalized_status || 'unknown');\n\nconst lastScan = pkg.Scans?.slice(-1)[0]?.ScanDetail?.ScannedLocation || prev.prev_current_location || null;\nconst edd = pkg.Status?.ExpectedDeliveryDate ? String(pkg.Status.ExpectedDeliveryDate).split('T')[0] : prev.prev_estimated_delivery || null;\nconst verifiedUrl = pkg.tracking_url || prev.prev_tracking_url || null;\n\nreturn {\n  json: {\n    ...prev,\n    new_status: normalized,\n    raw_status: pkg.Status?.Status || prev.prev_raw_status || 'UNKNOWN',\n    new_location: lastScan,\n    new_eta: edd,\n    tracking_url: verifiedUrl,\n    raw_payload: $json\n  }\n};"
+      },
+      "id": "ea2270d0-3c77-4dc0-b94a-4a5e1122eb04",
+      "name": "Normalize Delhivery Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $json;\nconst prevNormalized = j.prev_normalized_status;\nconst prevRaw = j.prev_raw_status;\nconst prevLoc = j.prev_current_location;\nconst prevEta = j.prev_estimated_delivery;\nconst prevUrl = j.prev_tracking_url;\n\nconst newNormalized = j.new_status;\nconst newRaw = j.raw_status;\nconst newLoc = j.new_location;\nconst newEta = j.new_eta;\nconst newUrl = j.tracking_url;\n\nconst statusChanged = newNormalized !== prevNormalized && newNormalized !== 'unknown';\nconst rawStatusChanged = newRaw && newRaw !== prevRaw;\nconst locChanged = newLoc && newLoc !== prevLoc;\nconst etaChanged = newEta && newEta !== prevEta;\nconst urlChanged = newUrl && newUrl !== prevUrl;\n\nconst changed = statusChanged || rawStatusChanged || locChanged || etaChanged || urlChanged;\n\nconst importantList = ['out_for_delivery', 'delivered', 'delivery_exception', 'rto', 'lost'];\nconst isImportant = statusChanged && importantList.includes(newNormalized);\n\nreturn {\n  json: {\n    ...j,\n    changed,\n    isImportant\n  }\n};"
+      },
+      "id": "7826c527-744f-4556-a693-32b884eea647",
+      "name": "Compare With Previous State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.changed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6d377dfd-47ef-4d80-984d-b9fd7b320529",
+      "name": "Status Changed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.shipments\nSET last_synced_at = NOW(), lease_token = NULL, lease_until = NULL\nWHERE id = $1 AND lease_token = $2;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.lease_token] }}"
+        }
+      },
+      "id": "aef4c35a-da48-4778-bd1d-1de4f94d51ae",
+      "name": "Touch Last Synced (No Change)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1584,
+        336
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH updated AS (\n  UPDATE wismo.shipments\n  SET normalized_status = $2,\n      raw_status = $3,\n      current_location = COALESCE($4, current_location),\n      tracking_url = COALESCE($11, tracking_url),\n      estimated_delivery = COALESCE($5, estimated_delivery),\n      last_updated_at = NOW(),\n      last_synced_at = NOW(),\n      lease_token = NULL,\n      lease_until = NULL\n  WHERE id = $1 AND lease_token = $7\n  RETURNING *\n),\nins_event AS (\n  INSERT INTO wismo.shipment_events (shipment_id, status, location, occurred_at, raw_payload)\n  SELECT id, normalized_status, current_location, NOW(), $6::jsonb\n  FROM updated\n)\nSELECT u.*, $8::text AS order_number, $9::uuid AS customer_id, $10::boolean AS is_important, $7::text AS lease_token\nFROM updated u;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.id,\n  $json.new_status,\n  $json.raw_status,\n  $json.new_location,\n  $json.new_eta,\n  JSON.stringify($json.raw_payload || {}),\n  $json.lease_token,\n  $json.order_number,\n  $json.customer_id,\n  $json.isImportant,\n  $json.tracking_url || null\n] }}"
+        }
+      },
+      "id": "29371ee1-24a8-46dd-81d7-fd5b9bdf4f6d",
+      "name": "Atomic Update Shipment & Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1584,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_important }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "dd1dadca-be1f-4ea2-99cf-af68554de690",
+      "name": "Important Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH eligible_customer AS (\n  SELECT c.id AS customer_id, ci.external_id AS phone\n  FROM wismo.customers c\n  JOIN wismo.channel_identities ci ON ci.customer_id = c.id\n  WHERE c.id = $1\n    AND ci.channel = 'whatsapp'\n    AND COALESCE(c.whatsapp_opt_out, false) = false\n    AND c.whatsapp_opt_in IS TRUE\n  LIMIT 1\n),\nclaim_notif AS (\n  INSERT INTO wismo.notification_events (notification_key, shipment_id, customer_id, status, attempts, lease_until, created_at)\n  SELECT $2, $3, customer_id, 'sending', 1, NOW() + INTERVAL '5 minutes', NOW()\n  FROM eligible_customer\n  ON CONFLICT (notification_key) DO UPDATE\n  SET attempts = wismo.notification_events.attempts + 1,\n      status = 'sending',\n      lease_until = NOW() + INTERVAL '5 minutes'\n  WHERE (\n    (wismo.notification_events.status = 'failed' AND wismo.notification_events.attempts < 3)\n    OR (wismo.notification_events.status IN ('pending', 'sending') AND wismo.notification_events.lease_until < NOW() AND wismo.notification_events.attempts < 3)\n  )\n  RETURNING notification_key\n)\nSELECT\n  (SELECT phone FROM eligible_customer) AS phone,\n  EXISTS(SELECT 1 FROM claim_notif) AS should_notify,\n  $2::text AS notification_key,\n  $3::uuid AS shipment_id;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.customer_id,\n  $json.id + ':notif:' + $json.normalized_status,\n  $json.id\n] }}"
+        }
+      },
+      "id": "aa3e960c-1d59-4016-b9c3-2c2bf4946050",
+      "name": "Claim Notification Lock & Eligibility",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2016,
+        96
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.should_notify }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a8061f57-3374-4025-900e-12f3ef19cdd2",
+      "name": "Notification Eligible & New?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $('Compare With Previous State').item.json;\nconst phone = $json.phone;\n\nlet text = '';\nif (s.new_status === 'out_for_delivery') {\n  text = `🚚 Delivery Update: Order #${s.order_number} is now out for delivery via ${s.courier.toUpperCase()}.`;\n  if (s.new_eta) {\n    text += ` Expected delivery: ${s.new_eta}.`;\n  }\n  text += ` Please inspect your package seal before sharing the delivery OTP with the agent.`;\n} else if (s.new_status === 'delivered') {\n  text = `✅ Delivered: Order #${s.order_number} has been delivered. Thank you for choosing us! Reply HELP if you need any assistance with your order.`;\n} else if (['delivery_exception', 'rto', 'lost'].includes(s.new_status)) {\n  text = `⚠️ Delivery Alert: Order #${s.order_number} encountered a logistics issue: ${s.raw_status || 'Delivery attempt failed'}. Our operations team has been alerted and will assist.`;\n}\n\nreturn {\n  json: {\n    phone,\n    notification_text: text,\n    shipment_id: s.id,\n    notification_key: $json.notification_key\n  }\n};"
+      },
+      "id": "08adce71-44ee-4d1c-b411-d49d79c95a92",
+      "name": "Build Proactive Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        32
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.META_SYSTEM_USER_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  messaging_product: 'whatsapp',\n  recipient_type: 'individual',\n  to: $json.phone,\n  type: 'text',\n  text: { body: $json.notification_text }\n}) }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "d43e18a4-ca8e-424a-85eb-8399113a3490",
+      "name": "Send Customer Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2688,
+        32
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.notification_events\nSET status = 'sent', sent_at = NOW(), lease_until = NULL\nWHERE notification_key = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Build Proactive Notification').item.json.notification_key] }}"
+        }
+      },
+      "id": "570eab63-cbf4-4013-a29c-169a8bab76b3",
+      "name": "Mark Notification Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2896,
+        -48
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.notification_events\nSET status = 'failed', lease_until = NULL\nWHERE notification_key = $1;\n\nINSERT INTO wismo.shipment_events (shipment_id, status, occurred_at, raw_payload)\nVALUES ($2, 'notification_send_failed', NOW(), $3::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Build Proactive Notification').item.json.notification_key,\n  $('Build Proactive Notification').item.json.shipment_id,\n  JSON.stringify($json)\n] }}"
+        }
+      },
+      "id": "626deb11-14c2-4307-a90b-1cb4929b1229",
+      "name": "Log Notification Send Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2896,
+        112
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "543004c2-bf24-43f7-8346-2cc3966aec51",
+      "name": "Schedule Trigger (Retry Due Notifications)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -432,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH eligible AS (\n  SELECT ne.notification_key\n  FROM wismo.notification_events ne\n  JOIN wismo.shipments s ON s.id = ne.shipment_id\n  JOIN wismo.orders o ON o.id = s.order_id\n  JOIN wismo.customers c ON c.id = ne.customer_id\n  JOIN wismo.channel_identities ci ON ci.customer_id = c.id AND ci.channel = 'whatsapp'\n  WHERE (\n      (ne.status = 'failed' AND ne.attempts < 3 AND (ne.lease_until IS NULL OR ne.lease_until < NOW()))\n      OR (ne.status = 'pending' AND ne.attempts < 3 AND (ne.lease_until IS NULL OR ne.lease_until < NOW()))\n      OR (ne.status = 'sending' AND ne.attempts < 3 AND ne.lease_until < NOW())\n    )\n    AND COALESCE(c.whatsapp_opt_out, false) = false\n    AND c.whatsapp_opt_in IS TRUE\n  ORDER BY ne.created_at ASC\n  LIMIT 20\n  FOR UPDATE OF ne SKIP LOCKED\n),\nclaimed AS (\n  UPDATE wismo.notification_events ne\n  SET status = 'sending',\n      lease_until = NOW() + INTERVAL '5 minutes',\n      attempts = ne.attempts + 1\n  FROM eligible\n  WHERE ne.notification_key = eligible.notification_key\n  RETURNING ne.*\n)\nSELECT\n  claimed.notification_key,\n  claimed.shipment_id,\n  claimed.customer_id,\n  s.order_id,\n  s.normalized_status AS current_shipment_status,\n  s.courier,\n  s.tracking_number,\n  s.current_location,\n  s.estimated_delivery,\n  o.order_number,\n  ci.external_id AS phone,\n  SPLIT_PART(claimed.notification_key, ':notif:', 2) AS target_milestone\nFROM claimed\nJOIN wismo.shipments s ON s.id = claimed.shipment_id\nJOIN wismo.orders o ON o.id = s.order_id\nJOIN wismo.customers c ON c.id = claimed.customer_id\nJOIN wismo.channel_identities ci ON ci.customer_id = c.id AND ci.channel = 'whatsapp';",
+        "options": {}
+      },
+      "id": "3f818e6a-dd02-434b-80b5-81ddc0c9a054",
+      "name": "Claim Due Notifications Batch",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -224,
+        720
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "62a99d25-fcce-4c60-a8c0-b5740f6a0139",
+      "name": "Loop Over Notifications",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        0,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $json;\nconst currentStatus = item.current_shipment_status;\nconst targetStatus = item.target_milestone;\n\nconst orderRank = {\n  'pending': 1,\n  'confirmed': 2,\n  'picked_up': 3,\n  'in_transit': 4,\n  'out_for_delivery': 5,\n  'delivered': 6,\n  'delivery_exception': 6,\n  'rto': 6,\n  'lost': 6,\n  'cancelled': 7\n};\n\nconst currentRank = orderRank[currentStatus] || 0;\nconst targetRank = orderRank[targetStatus] || 0;\n\nconst isSuperseded = (currentRank > targetRank) || (currentStatus === 'delivered' && targetStatus !== 'delivered');\nconst isValid = !isSuperseded && currentStatus === targetStatus;\n\nreturn {\n  json: {\n    ...item,\n    is_valid: isValid\n  }\n};"
+      },
+      "id": "7681f610-ffb8-412a-8aa0-7b0310dda3c3",
+      "name": "Check Notification Superseded",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2d470f5-e447-4dcd-baaf-65ac2a2faeeb",
+      "name": "Notification Milestone Still Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        448,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.notification_events\nSET status = 'superseded', lease_until = NULL\nWHERE notification_key = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.notification_key] }}"
+        }
+      },
+      "id": "5dfe845a-17d1-40ae-89de-4193c6d833ab",
+      "name": "Mark Notification Superseded",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        656,
+        832
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $json;\nconst phone = s.phone;\nlet text = '';\nif (s.target_milestone === 'out_for_delivery') {\n  text = `🚚 Delivery Update: Order #${s.order_number} is now out for delivery via ${(s.courier || 'COURIER').toUpperCase()}.`;\n  if (s.estimated_delivery) {\n    text += ` Expected delivery: ${s.estimated_delivery}.`;\n  }\n  text += ` Please inspect your package seal before sharing the delivery OTP with the agent.`;\n} else if (s.target_milestone === 'delivered') {\n  text = `✅ Delivered: Order #${s.order_number} has been delivered. Thank you for choosing us! Reply HELP if you need any assistance with your order.`;\n} else if (['delivery_exception', 'rto', 'lost'].includes(s.target_milestone)) {\n  text = `⚠️ Delivery Alert: Order #${s.order_number} encountered a logistics issue. Our operations team has been alerted and will assist.`;\n}\n\nreturn {\n  json: {\n    phone,\n    notification_text: text,\n    shipment_id: s.shipment_id,\n    notification_key: s.notification_key\n  }\n};"
+      },
+      "id": "0963a13a-fe4f-4b72-8844-ae30108e3490",
+      "name": "Build Proactive Notification (Retry)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        656,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.META_SYSTEM_USER_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  messaging_product: 'whatsapp',\n  recipient_type: 'individual',\n  to: $json.phone,\n  type: 'text',\n  text: { body:$json.notification_text }\n}) }}",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "4c3333b1-f271-4f06-bf72-56d59a8f6642",
+      "name": "Send Customer Notification (Retry)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        640
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.notification_events\nSET status = 'sent', sent_at = NOW(), lease_until = NULL\nWHERE notification_key = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Build Proactive Notification (Retry)').item.json.notification_key] }}"
+        }
+      },
+      "id": "e0351b3f-51a6-4df9-b0c1-ea3dc56ba43d",
+      "name": "Mark Notification Sent (Retry)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1104,
+        560
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.notification_events\nSET status = 'failed', lease_until = NULL\nWHERE notification_key = $1;\n\nINSERT INTO wismo.shipment_events (shipment_id, status, occurred_at, raw_payload)\nVALUES ($2, 'notification_send_failed', NOW(), $3::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Build Proactive Notification (Retry)').item.json.notification_key,\n  $('Build Proactive Notification (Retry)').item.json.shipment_id,\n  JSON.stringify($json)\n] }}"
+        }
+      },
+      "id": "6679433d-1eec-4b74-8c36-72d73954ea51",
+      "name": "Log Notification Send Failure (Retry)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1104,
+        720
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## WF-1 — Customer WISMO Tracking\nDeterministic inbound tracking pipeline. AI classifies intent and extracts entity references only. All shipment facts originate from PostgreSQL and live courier APIs. Order lookups are strictly scoped to the authenticated customer ID.",
+        "height": 180,
+        "width": 620,
+        "color": 6
+      },
+      "id": "b004300c-d3fb-43b4-858d-8281a88b1f7d",
+      "name": "Architecture Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -2416,
+        -1552
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wismo/whatsapp",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "8b046bb4-5842-41f4-ba18-06d5d99192f3",
+      "name": "WhatsApp Webhook (POST)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        -2416,
+        -1152
+      ],
+      "webhookId": "604c4729-33c8-4c57-bc1e-217887afece2"
+    },
+    {
+      "parameters": {
+        "path": "wismo/whatsapp",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "d624991c-b096-4540-af5f-fc6f186587ba",
+      "name": "WhatsApp Webhook (GET Challenge)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        -2416,
+        -992
+      ],
+      "webhookId": "209d38fb-e44b-4c76-ab76-4f2533b316ee"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wismo/instagram",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "e04e72c4-b298-4b48-8b8f-2a2d82a339c6",
+      "name": "Instagram Webhook (POST)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        -2416,
+        -832
+      ],
+      "webhookId": "68ee5180-013b-4e83-8cc7-db55f8b2d2bc"
+    },
+    {
+      "parameters": {
+        "path": "wismo/instagram",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "8cf75376-35d5-4b2f-9da1-22a11d03325b",
+      "name": "Instagram Webhook (GET Challenge)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        -2416,
+        -672
+      ],
+      "webhookId": "01d1ef37-fa1a-434a-9c74-3ebfeff70cfc"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "id": "63423f79-a568-4dda-9f2f-a329389ad9d3",
+      "name": "Schedule Trigger (Reap Abandoned Inbound Events)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1072,
+        -1264
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH eligible AS (\n  SELECT event_key\n  FROM wismo.idempotency_events\n  WHERE (\n    (status = 'processing' AND lease_until < NOW() AND attempts < 3)\n    OR (status = 'failed' AND attempts < 3 AND (lease_until IS NULL OR lease_until < NOW()))\n  )\n  ORDER BY created_at ASC\n  LIMIT 5\n  FOR UPDATE SKIP LOCKED\n),\nclaimed AS (\n  UPDATE wismo.idempotency_events\n  SET status = 'processing',\n      lease_until = NOW() + INTERVAL '2 minutes',\n      attempts = attempts + 1\n  FROM eligible\n  WHERE wismo.idempotency_events.event_key = eligible.event_key\n  RETURNING wismo.idempotency_events.*\n)\nSELECT\n  c.event_key,\n  c.source AS channel,\n  (c.payload->>'customer_external_id')::text AS customer_external_id,\n  (c.payload->>'message_id')::text AS message_id,\n  (c.payload->>'message_text')::text AS message_text,\n  'reclaimed' AS action\nFROM claimed c;",
+        "options": {}
+      },
+      "id": "cab9f4e8-560b-43d5-ab84-bcb73704d5d2",
+      "name": "Reclaim Abandoned Inbound Events",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -848,
+        -1264
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const query = $input.item.json.query || {};\nconst mode = query['hub.mode'];\nconst token = query['hub.verify_token'];\nconst challenge = query['hub.challenge'];\nconst expectedToken = $env.META_VERIFY_TOKEN;\n\nif (expectedToken && mode === 'subscribe' && token === expectedToken) {\n  return { json: { valid: true, challenge: challenge } };\n}\nreturn { json: { valid: false, challenge: null } };"
+      },
+      "id": "add57cb3-aa11-4c5b-b307-c1baadff74ec",
+      "name": "Handle Meta Webhook Challenge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2176,
+        -832
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "bb240d4c-28e5-49c7-8ea7-502bf435f40b",
+      "name": "Challenge Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -1952,
+        -832
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.challenge }}",
+        "options": {}
+      },
+      "id": "c0fe1749-fde5-43d6-bacd-05378302c58e",
+      "name": "Respond Meta Challenge (200)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -1728,
+        -896
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'forbidden_invalid_verify_token' } }}",
+        "options": {}
+      },
+      "id": "cebc6370-1306-4df7-ba0b-f6bbd3bbb342",
+      "name": "Reject Challenge (403)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -1728,
+        -784
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst rawBuffer = $input.item.binary?.data ? Buffer.from($input.item.binary.data.data, 'base64') : null;\nif (!rawBuffer || rawBuffer.length === 0) {\n  return { json: { valid: false, reason: 'empty_raw_body' } };\n}\n\nconst headers = $input.item.json.headers || {};\nconst sigHeader = headers['x-hub-signature-256'] || '';\nconst secret = $env.META_APP_SECRET || '';\nconst digest = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBuffer).digest('hex');\n\nfunction timingSafeEqual(a, b) {\n  const bufA = Buffer.from(a); const bufB = Buffer.from(b);\n  if (bufA.length !== bufB.length) return false;\n  return crypto.timingSafeEqual(bufA, bufB);\n}\n\nconst valid = sigHeader.length > 0 && secret.length > 0 && timingSafeEqual(sigHeader, digest);\nlet parsed = {};\ntry { parsed = JSON.parse(rawBuffer.toString('utf8')); } catch(e) {}\n\nreturn { json: { valid, parsed, raw_string: rawBuffer.toString('utf8'), channel: 'whatsapp' } };"
+      },
+      "id": "e2b58a45-c884-4cab-ba53-30fefba66b1f",
+      "name": "Verify WhatsApp Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2176,
+        -1152
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst rawBuffer = $input.item.binary?.data ? Buffer.from($input.item.binary.data.data, 'base64') : null;\nif (!rawBuffer || rawBuffer.length === 0) {\n  return { json: { valid: false, reason: 'empty_raw_body' } };\n}\n\nconst headers = $input.item.json.headers || {};\nconst sigHeader = headers['x-hub-signature-256'] || headers['x-hub-signature-256-ig'] || '';\nconst secret = $env.INSTAGRAM_APP_SECRET || $env.META_APP_SECRET || '';\nconst digest = 'sha256=' + crypto.createHmac('sha256', secret).update(rawBuffer).digest('hex');\n\nfunction timingSafeEqual(a, b) {\n  const bufA = Buffer.from(a); const bufB = Buffer.from(b);\n  if (bufA.length !== bufB.length) return false;\n  return crypto.timingSafeEqual(bufA, bufB);\n}\n\nconst valid = sigHeader.length > 0 && secret.length > 0 && timingSafeEqual(sigHeader, digest);\nlet parsed = {};\ntry { parsed = JSON.parse(rawBuffer.toString('utf8')); } catch(e) {}\n\nreturn { json: { valid, parsed, raw_string: rawBuffer.toString('utf8'), channel: 'instagram' } };"
+      },
+      "id": "5d1b16c8-7881-46e9-9600-174f2a178f5c",
+      "name": "Verify Instagram Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2176,
+        -992
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c07074ce-3d8f-4386-a3ba-cbd3aecfad68",
+      "name": "Signature Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -1952,
+        -1072
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'invalid_signature' } }}",
+        "options": {}
+      },
+      "id": "261ad7f9-810d-46e7-ac75-cb4220937230",
+      "name": "Reject (401)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -1952,
+        -1280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst p = $json.parsed || {};\nconst channel = $json.channel;\nconst value = p.entry?.[0]?.changes?.[0]?.value || p.entry?.[0]?.messaging?.[0] || {};\nconst message = value?.messages?.[0] || value?.message || {};\nconst senderId = (message?.from || value?.sender?.id || '').trim();\nconst text = (message?.text?.body || message?.text || '').trim();\n\nlet msgId = message?.id || message?.mid || null;\nif (!msgId && senderId) {\n  const rawString = $json.raw_string || '';\n  msgId = 'hash_' + crypto.createHash('sha256').update(`${channel}:${senderId}:${rawString}`).digest('hex');\n}\n\nreturn {\n  json: {\n    channel,\n    customer_external_id: senderId || null,\n    message_id: msgId || null,\n    message_text: text,\n    received_at: new Date().toISOString()\n  }\n};"
+      },
+      "id": "5ec7b6f5-eedc-4ddd-8ec8-abee3435b44c",
+      "name": "Normalize Incoming Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1728,
+        -1072
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.customer_external_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            },
+            {
+              "leftValue": "={{ $json.message_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            },
+            {
+              "leftValue": "={{ ['whatsapp', 'instagram'].includes($json.channel) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d3d2d094-caf6-4fe7-a3bf-1c7fb4cd3f7f",
+      "name": "Message Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -1520,
+        -1072
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'malformed_message_payload' } }}",
+        "options": {}
+      },
+      "id": "4bc7df0f-f860-4807-92c1-f166ea6014d9",
+      "name": "Reject (400)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -1520,
+        -1280
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH existing AS (\n  SELECT event_key, status, lease_until\n  FROM wismo.idempotency_events\n  WHERE event_key = $1\n  FOR UPDATE\n),\ninserted AS (\n  INSERT INTO wismo.idempotency_events (event_key, source, status, lease_until, attempts, payload, created_at)\n  SELECT $1, $2, 'processing', NOW() + INTERVAL '2 minutes', 1, $3::jsonb, NOW()\n  WHERE NOT EXISTS (SELECT 1 FROM existing)\n  RETURNING event_key, 'new' AS action\n),\nreclaimed AS (\n  UPDATE wismo.idempotency_events\n  SET status = 'processing',\n      lease_until = NOW() + INTERVAL '2 minutes',\n      attempts = attempts + 1,\n      payload = COALESCE($3::jsonb, payload)\n  WHERE event_key = $1\n    AND attempts < 3\n    AND (\n      status = 'failed'\n      OR (status = 'processing' AND lease_until < NOW())\n    )\n  RETURNING event_key, 'reclaimed' AS action\n)\nSELECT COALESCE(\n  (SELECT action FROM inserted UNION ALL SELECT action FROM reclaimed LIMIT 1),\n  'duplicate'\n) AS action,\n$1::text AS event_key,\n$2::text AS channel,\n$4::text AS customer_external_id,\n$5::text AS message_id,\n$6::text AS message_text;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.channel + ':' + $json.message_id,\n  $json.channel,\n  JSON.stringify({ channel: $json.channel, customer_external_id: $json.customer_external_id, message_id: $json.message_id, message_text: $json.message_text }),\n  $json.customer_external_id,\n  $json.message_id,\n  $json.message_text\n] }}"
+        }
+      },
+      "id": "633610e4-2969-4f82-9f43-193752bc1340",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -1296,
+        -1072
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ ['new', 'reclaimed'].includes($json.action) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "dee164f5-8322-46bd-ae8b-edd05d65aa12",
+      "name": "New Message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -1072,
+        -1072
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'duplicate_ignored' } }}",
+        "options": {}
+      },
+      "id": "53170037-c823-4500-bd57-436f5f12fc15",
+      "name": "Respond 200 (Duplicate)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -1072,
+        -880
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'received' } }}",
+        "options": {}
+      },
+      "id": "b0e9d359-9edf-4d43-9dbe-1476e68d2a60",
+      "name": "Respond 200 (ACK)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -848,
+        -1072
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH found AS (\n  SELECT c.id AS customer_id, c.name AS customer_name\n  FROM wismo.channel_identities ci\n  JOIN wismo.customers c ON c.id = ci.customer_id\n  WHERE ci.channel = $1 AND ci.external_id = $2\n  LIMIT 1\n)\nSELECT\n  (SELECT customer_id FROM found) AS customer_id,\n  (SELECT customer_name FROM found) AS customer_name,\n  $1::text AS channel,\n  $2::text AS customer_external_id,\n  $3::text AS message_id,\n  $4::text AS message_text;",
+        "options": {
+          "queryReplacement": "={{ [$json.channel, $json.customer_external_id, $json.message_id, $json.message_text] }}"
+        }
+      },
+      "id": "6d23e707-28b4-4b47-9e1a-cfe5cdc2f89e",
+      "name": "Identify Customer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -640,
+        -1072
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.customer_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "47a3e67e-ef67-43ae-9d8a-42670982901e",
+      "name": "Customer Known?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        -1072
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return {\n  json: {\n    reply_text: \"I couldn't verify this chat with an account on file. Please contact customer support or message us from the phone/account linked to your order.\",\n    channel: $json.channel,\n    customer_external_id: $json.customer_external_id,\n    message_id: $json.message_id,\n    shipment_id: null\n  }\n};"
+      },
+      "id": "6fc664f3-c4b8-448c-9ec9-c958c35b22a5",
+      "name": "Send Unknown-Sender Refusal",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -192,
+        -880
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH state_row AS (\n  SELECT pending_action, pending_context\n  FROM wismo.conversation_state\n  WHERE customer_id = $1 AND channel = $2\n    AND updated_at > NOW() - INTERVAL '24 HOURS'\n  LIMIT 1\n)\nSELECT\n  (SELECT pending_action FROM state_row) AS pending_action,\n  (SELECT pending_context FROM state_row) AS pending_context,\n  $1::uuid AS customer_id,\n  $2::text AS channel,\n  $3::text AS customer_external_id,\n  $4::text AS message_id,\n  $5::text AS message_text;",
+        "options": {
+          "queryReplacement": "={{ [$json.customer_id, $json.channel, $json.customer_external_id, $json.message_id, $json.message_text] }}"
+        }
+      },
+      "id": "b4a687ee-5d2a-4fe0-8b25-0eaa7c51d395",
+      "name": "Load Conversation State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -192,
+        -1152
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.pending_action }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e3053b3e-39ac-45db-ae4a-e4c4dac29183",
+      "name": "Has Pending Action?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        32,
+        -1152
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const text = ($json.message_text || '').trim();\nconst state = $json.pending_action;\nconst context = typeof $json.pending_context === 'string' ? JSON.parse($json.pending_context || '[]') : ($json.pending_context || []);\n\nlet isValid = false;\nlet isShipmentDirect = false;\nlet resolvedShipmentId = null;\nlet resolvedOrder = null;\nlet resolvedTracking = null;\nlet errorReply = null;\n\nif (state === 'awaiting_order_selection') {\n  const digit = parseInt(text.replace(/\\D/g, ''), 10);\n  if (!isNaN(digit) && digit >= 1 && digit <= context.length) {\n    isValid = true;\n    resolvedOrder = context[digit - 1].order_number;\n  } else {\n    errorReply = `Please reply with a valid number between 1 and ${context.length} to select your order.`;\n  }\n} else if (state === 'awaiting_shipment_selection') {\n  const digit = parseInt(text.replace(/\\D/g, ''), 10);\n  if (!isNaN(digit) && digit >= 1 && digit <= context.length) {\n    isValid = true;\n    isShipmentDirect = true;\n    resolvedShipmentId = context[digit - 1].shipment_id;\n    resolvedOrder = context[digit - 1].order_number;\n  } else {\n    errorReply = `Please reply with a valid number between 1 and ${context.length} to select your package.`;\n  }\n} else if (state === 'awaiting_order_number') {\n  const cleanNumeric = text.replace(/[^0-9]/g, '');\n  const cleanAlpha = text.replace(/[^a-zA-Z0-9]/g, '');\n  \n  if (cleanNumeric.length >= 4 && cleanNumeric.length <= 6 && cleanNumeric === cleanAlpha) {\n    isValid = true;\n    resolvedOrder = cleanNumeric;\n  } else if (cleanAlpha.length >= 8) {\n    isValid = true;\n    resolvedTracking = cleanAlpha;\n  } else {\n    errorReply = \"Please reply with a valid 4 to 6-digit order number (e.g. #10482) or your courier AWB.\";\n  }\n}\n\nif (!isValid) {\n  return {\n    json: {\n      ...$json,\n      is_valid_pending: false,\n      reply_text: errorReply || \"I couldn't understand that response. Please provide a valid selection.\",\n      set_pending: state,\n      pending_context: $json.pending_context,\n      clear_pending: false,\n      shipment_id: null\n    }\n  };\n}\n\nreturn {\n  json: {\n    ...$json,\n    is_valid_pending: true,\n    is_shipment_direct: isShipmentDirect,\n    shipment_id: resolvedShipmentId,\n    order_number: resolvedOrder,\n    tracking_number: resolvedTracking,\n    clear_pending: true\n  }\n};"
+      },
+      "id": "5e1b6c56-f7d2-4102-8a9c-e000abefdd5a",
+      "name": "Resolve Pending Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        -1264
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_valid_pending }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "27327e46-166d-4d9d-b870-18fdf796a92f",
+      "name": "Pending Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        480,
+        -1264
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_shipment_direct }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b9a2bb74-a53a-47f1-91de-2b09337f3e9d",
+      "name": "Direct Shipment Selection?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        688,
+        -1344
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Load Conversation State').item.json;\nlet raw = {};\ntry {\n  const rawContent = $input.item.json.message?.content || $input.item.json.text || '{}';\n  raw = JSON.parse(rawContent);\n} catch(e) {}\n\nconst allowed = ['TRACK_ORDER', 'NON_TRACKING', 'UNCLEAR'];\nlet intent = allowed.includes(raw.intent) ? raw.intent : 'UNCLEAR';\nlet conf = typeof raw.confidence === 'number' ? Math.max(0, Math.min(1, raw.confidence)) : 0;\n\nlet orderNum = raw.order_number ? String(raw.order_number).replace(/[^0-9]/g, '') : null;\nlet trackNum = raw.tracking_number ? String(raw.tracking_number).trim() : null;\n\nconst rawText = (prev.message_text || '').trim();\nconst explicitOrderMatch = rawText.match(/#([0-9]{4,6})\\b/);\nif (explicitOrderMatch) {\n  orderNum = explicitOrderMatch[1];\n  intent = 'TRACK_ORDER';\n  conf = Math.max(conf, 0.95);\n} else if (!orderNum && !trackNum) {\n  const cleanAlpha = rawText.replace(/[^a-zA-Z0-9]/g, '');\n  const isAllNumeric = /^[0-9]+$/.test(cleanAlpha);\n  \n  if (isAllNumeric && cleanAlpha.length >= 4 && cleanAlpha.length <= 6) {\n    orderNum = cleanAlpha;\n    intent = 'TRACK_ORDER';\n    conf = Math.max(conf, 0.9);\n  } else if (cleanAlpha.length >= 8) {\n    trackNum = cleanAlpha;\n    intent = 'TRACK_ORDER';\n    conf = Math.max(conf, 0.9);\n  }\n}\n\nif (conf < 0.65) {\n  intent = 'UNCLEAR';\n}\n\nreturn {\n  json: {\n    ...prev,\n    intent,\n    order_number: orderNum || null,\n    tracking_number: trackNum || null,\n    confidence: conf,\n    clear_pending: true\n  }\n};"
+      },
+      "id": "be98cec3-9c37-4fe8-81c0-84c04b9770a6",
+      "name": "Validate AI Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        -1056
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "TRACK_ORDER",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "NON_TRACKING",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "ca1e5fe8-40d7-46ce-8b6e-a624c947c2b6",
+      "name": "Intent Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        688,
+        -1056
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return {\n  json: {\n    ...$json,\n    reply_text: \"That request is outside order tracking. For assistance with returns, products, or store policies, please contact our support team directly.\",\n    clear_pending: true,\n    shipment_id: null\n  }\n};"
+      },
+      "id": "33f11680-ccc8-4834-b29e-87587ed3ba6b",
+      "name": "Non-Tracking Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        -1056
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return {\n  json: {\n    ...$json,\n    reply_text: \"I didn't quite catch that. You can ask me to 'track my order', or send your order number / AWB directly.\",\n    clear_pending: true,\n    shipment_id: null\n  }\n};"
+      },
+      "id": "90a69da1-b46c-48a7-a535-f78ca32bd334",
+      "name": "Unclear Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        -896
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH matched AS (\n  SELECT o.id, o.order_number, o.status\n  FROM wismo.orders o\n  WHERE o.customer_id = $1 AND o.status = 'active'\n    AND ($2::text IS NULL OR o.order_number = $2)\n    AND ($3::text IS NULL OR EXISTS (\n      SELECT 1 FROM wismo.shipments s WHERE s.order_id = o.id AND s.tracking_number = $3\n    ))\n  ORDER BY o.created_at DESC\n)\nSELECT\n  COALESCE(json_agg(matched), '[]'::json) AS orders,\n  COUNT(matched.id)::int AS count,\n  $1::uuid AS customer_id,\n  $4::text AS channel,\n  $5::text AS customer_external_id,\n  $6::text AS message_id\nFROM (SELECT 1) d\nLEFT JOIN matched ON true\nGROUP BY d;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.customer_id,\n  $json.order_number || null,\n  $json.tracking_number || null,\n  $json.channel,\n  $json.customer_external_id,\n  $json.message_id\n] }}"
+        }
+      },
+      "id": "efed61aa-15d1-4a81-ba13-935b0dbacb72",
+      "name": "Find Relevant Order(s)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        912,
+        -1232
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.orders;\nconst orders = Array.isArray(raw) ? raw.filter(o => o && o.id) : [];\nreturn { json: { ...$json, count: orders.length, orders } };"
+      },
+      "id": "85f04965-3adc-4797-be89-f78e3750f6f1",
+      "name": "Evaluate Orders Found",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        -1232
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.count }}",
+                    "rightValue": 0,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.count }}",
+                    "rightValue": 1,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "94681832-18c5-4280-9de0-2c9b749198c4",
+      "name": "Order Count?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1360,
+        -1232
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return {\n  json: {\n    ...$json,\n    reply_text: \"I couldn't locate an active order under your account. Please send your 4 to 6-digit order number (e.g. #10482) or tracking AWB.\",\n    set_pending: 'awaiting_order_number',\n    pending_context: null,\n    clear_pending: false,\n    shipment_id: null\n  }\n};"
+      },
+      "id": "0cd16b61-458d-41d6-ac50-300563420c8a",
+      "name": "Ask For Order Number",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        -1344
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const orders = $json.orders || [];\nconst list = orders.map((o, i) => `${i + 1}. Order #${o.order_number}`).join('\\n');\nconst safeContext = orders.map(o => ({ order_number: o.order_number }));\nreturn {\n  json: {\n    ...$json,\n    reply_text: `I found ${orders.length} active orders:\\n${list}\\n\\nReply with the number (e.g., 1 or 2) to track that shipment.`,\n    set_pending: 'awaiting_order_selection',\n    pending_context: JSON.stringify(safeContext),\n    clear_pending: false,\n    shipment_id: null\n  }\n};"
+      },
+      "id": "332e591d-010c-4e83-b6a8-0b42b0549bff",
+      "name": "Ask Customer To Select Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        -1104
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH matched_shipments AS (\n  SELECT s.id AS shipment_id, s.order_id, s.courier, s.tracking_number, s.normalized_status,\n         s.raw_status, s.current_location, s.estimated_delivery, s.tracking_url, s.last_synced_at,\n         o.order_number, o.customer_id\n  FROM wismo.shipments s\n  JOIN wismo.orders o ON o.id = s.order_id\n  WHERE s.order_id = $1 AND o.customer_id = $2\n  ORDER BY s.created_at ASC\n)\nSELECT\n  COALESCE(json_agg(matched_shipments), '[]'::json) AS shipments,\n  COUNT(matched_shipments.shipment_id)::int AS count,\n  $1::uuid AS order_id,\n  $2::uuid AS customer_id,\n  $3::text AS channel,\n  $4::text AS customer_external_id,\n  $5::text AS message_id\nFROM (SELECT 1) d\nLEFT JOIN matched_shipments ON true\nGROUP BY d;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.orders[0].id,\n  $json.customer_id,\n  $json.channel,\n  $json.customer_external_id,\n  $json.message_id\n] }}"
+        }
+      },
+      "id": "61f0ac67-bf0e-4797-8eeb-77019db1be52",
+      "name": "Retrieve Shipments for Order",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1600,
+        -1232
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH matched AS (\n  SELECT s.id AS shipment_id, s.order_id, s.courier, s.tracking_number, s.normalized_status,\n         s.raw_status, s.current_location, s.estimated_delivery, s.tracking_url, s.last_synced_at,\n         o.order_number, o.customer_id\n  FROM wismo.shipments s\n  JOIN wismo.orders o ON o.id = s.order_id\n  WHERE s.id = $1 AND o.customer_id = $2\n  LIMIT 1\n)\nSELECT\n  (SELECT shipment_id FROM matched) AS shipment_id,\n  (SELECT order_id FROM matched) AS order_id,\n  (SELECT courier FROM matched) AS courier,\n  (SELECT tracking_number FROM matched) AS tracking_number,\n  (SELECT normalized_status FROM matched) AS normalized_status,\n  (SELECT raw_status FROM matched) AS raw_status,\n  (SELECT current_location FROM matched) AS current_location,\n  (SELECT estimated_delivery FROM matched) AS estimated_delivery,\n  (SELECT tracking_url FROM matched) AS tracking_url,\n  (SELECT last_synced_at FROM matched) AS last_synced_at,\n  (SELECT order_number FROM matched) AS order_number,\n  $2::uuid AS customer_id,\n  $3::text AS channel,\n  $4::text AS customer_external_id,\n  $5::text AS message_id,\n  EXISTS(SELECT 1 FROM matched) AS exact_found;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.shipment_id,\n  $json.customer_id,\n  $json.channel,\n  $json.customer_external_id,\n  $json.message_id\n] }}"
+        }
+      },
+      "id": "7ce8edd2-d8ab-4173-bed2-1df53a73d32e",
+      "name": "Retrieve Exact Shipment Info",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        688,
+        -1456
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.shipments;\nconst shipments = Array.isArray(raw) ? raw.filter(s => s && s.shipment_id) : [];\nreturn { json: { ...$json, count: shipments.length, shipments } };"
+      },
+      "id": "7de7afa6-46b5-4ee3-b3ad-75748f02c5fe",
+      "name": "Evaluate Shipments Found",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        -1232
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.count }}",
+                    "rightValue": 0,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.count }}",
+                    "rightValue": 1,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "a7d42dd3-f009-447a-8e30-b70285289218",
+      "name": "Shipment Count?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        2032,
+        -1232
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const sList = $json.shipments || [];\nconst list = sList.map((s, i) => `${i + 1}. Package via ${(s.courier || 'courier').toUpperCase()} (AWB: ${s.tracking_number || 'Pending'})`).join('\\n');\nconst safeContext = sList.map(s => ({\n  shipment_id: s.shipment_id,\n  order_number: s.order_number,\n  courier: s.courier,\n  tracking_number: s.tracking_number\n}));\n\nreturn {\n  json: {\n    ...$json,\n    reply_text: `Order #${sList[0]?.order_number} has ${sList.length} packages:\\n${list}\\n\\nReply with the number (e.g., 1 or 2) to track that specific package.`,\n    set_pending: 'awaiting_shipment_selection',\n    pending_context: JSON.stringify(safeContext),\n    clear_pending: false,\n    shipment_id: null\n  }\n};"
+      },
+      "id": "2487ddc8-4a25-4cce-950e-15b1d578b484",
+      "name": "Ask Customer To Select Shipment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        -1120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $json.shipments ? $json.shipments[0] : $json;\nif (!s || (!s.shipment_id && !s.exact_found)) {\n  return {\n    json: {\n      ...$json,\n      exact_found: false,\n      reply_text: \"We could not locate that package under your account. Please reply with your order number to try again.\",\n      clear_pending: true,\n      shipment_id: null\n    }\n  };\n}\n\nconst hasTracking = !!s.tracking_number && s.tracking_number.trim().length > 0;\nconst staleThreshold = 15 * 60 * 1000;\nconst isStale = !s.last_synced_at || (Date.now() - new Date(s.last_synced_at).getTime()) > staleThreshold;\nconst needsLiveCall = hasTracking && isStale;\n\nreturn {\n  json: {\n    ...$json,\n    ...s,\n    exact_found: true,\n    has_tracking: hasTracking,\n    needs_live_call: needsLiveCall,\n    courier: (s.courier || 'unknown').toLowerCase().trim()\n  }\n};"
+      },
+      "id": "b54eb44f-3a3e-414e-b021-1697ca3b8e09",
+      "name": "Inspect Shipment Details",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        -1232
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.exact_found }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2808b5a8-3d91-44dc-9b74-48314023bcde",
+      "name": "Exact Shipment Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        -1232
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.has_tracking }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "413ad6b7-b29d-423c-8e6b-ac6d9cf45512",
+      "name": "No Tracking Number Yet?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        -1232
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const orderNum = $json.order_number || '';\nreturn {\n  json: {\n    ...$json,\n    reply_text: `Order #${orderNum} does not have courier tracking available yet. Tracking information will appear once the shipment is handed to the courier.`,\n    clear_pending: true,\n    shipment_id: $json.shipment_id || null\n  }\n};"
+      },
+      "id": "38378717-8b74-45ce-87ac-2c3b9325c84a",
+      "name": "Reply: Not Yet Shipped",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2912,
+        -1360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needs_live_call }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "00f01261-6f3b-48b6-848b-5225b98dd0df",
+      "name": "Needs Live Call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2912,
+        -1152
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return {\n  json: {\n    ...$json,\n    reply_text: `Order #${$json.order_number} is dispatched via ${$json.courier}. Live tracking sync is currently unconfigured. Please check your order confirmation email/SMS for tracking updates.`,\n    clear_pending: true,\n    shipment_id: $json.shipment_id || null\n  }\n};"
+      },
+      "id": "b96a2e6f-1444-4ba1-b061-cd569b852356",
+      "name": "Unsupported Courier -> Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        -1072
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Inspect Shipment Details').item.json;\nconst statusMap = {\n  in_transit: 'In Transit', out_for_delivery: 'Out for Delivery', delivered: 'Delivered',\n  confirmed: 'Confirmed', picked_up: 'Picked Up'\n};\n\nlet text = '';\nif (prev.normalized_status && prev.normalized_status !== 'unknown') {\n  text = `Live tracking updates are temporarily unavailable from ${prev.courier.toUpperCase()}.\\n\\nLast Known Status: ${statusMap[prev.normalized_status] || prev.normalized_status}`;\n  if (prev.current_location) text += `\\nLocation: ${prev.current_location}`;\n  if (prev.tracking_url) text += `\\nLive Link: ${prev.tracking_url}`;\n} else {\n  text = `Live tracking updates are temporarily unavailable from ${prev.courier.toUpperCase()}. Please check back shortly or check your order confirmation.`;\n}\n\nreturn {\n  json: {\n    ...prev,\n    reply_text: text,\n    clear_pending: true,\n    shipment_id: prev.shipment_id\n  }\n};"
+      },
+      "id": "0907e03d-309a-4a38-b279-5a295e5f7f8f",
+      "name": "Courier API Failure Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        -1072
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wismo.shipment_events (shipment_id, status, occurred_at, raw_payload)\nVALUES ($1, 'courier_api_error', NOW(), $2::jsonb)\nRETURNING $3::text AS reply_text, $4::boolean AS clear_pending, $1::uuid AS shipment_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.shipment_id, JSON.stringify($json), $json.reply_text, $json.clear_pending] }}"
+        }
+      },
+      "id": "003ae176-d767-4592-b2db-12607ce2a32c",
+      "name": "Record Courier API Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3808,
+        -1072
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $json;\nconst escalate = ['delivery_exception', 'rto', 'lost'].includes(s.normalized_status);\nreturn { json: { ...s, escalate, clear_pending: true } };"
+      },
+      "id": "e8c6b647-dc09-47ec-ace1-fe9182a11931",
+      "name": "Apply Business Rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3808,
+        -1280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.escalate }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e17e7344-89ab-4c41-bda0-ab8412edae93",
+      "name": "Escalation Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4032,
+        -1280
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return {\n  json: {\n    ...$json,\n    reply_text: `⚠️ Delivery Alert: Order #${$json.order_number} has an active update: ${$json.raw_status || 'Delivery exception'}. Please contact our customer support team directly for assistance with this delivery.`,\n    clear_pending: true,\n    shipment_id: $json.shipment_id || null\n  }\n};"
+      },
+      "id": "ba768829-6301-41d0-a7b9-819228194a3b",
+      "name": "Escalation Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4256,
+        -1184
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const s = $json;\nconst statusMap = {\n  pending: 'Pending',\n  confirmed: 'Confirmed',\n  picked_up: 'Picked Up',\n  in_transit: 'In Transit',\n  out_for_delivery: 'Out for Delivery',\n  delivered: 'Delivered',\n  unknown: 'Tracking status is currently unavailable'\n};\n\nif (s.normalized_status === 'delivered') {\n  return { json: { ...s, reply_text: `✅ Order #${s.order_number} has been delivered. Thank you for shopping with us!`, clear_pending: true, shipment_id: s.shipment_id || null } };\n}\n\nlet text = `📦 Order #${s.order_number}\\n\\n🚚 Courier: ${(s.courier || 'COURIER').toUpperCase()}\\n📍 Status: ${statusMap[s.normalized_status] || s.normalized_status}`;\nif (s.current_location) text += `\\n🏢 Location: ${s.current_location}`;\nif (s.estimated_delivery) text += `\\n📅 Expected: ${s.estimated_delivery}`;\nif (s.tracking_url) text += `\\n🔗 Track Live: ${s.tracking_url}`;\n\nreturn { json: { ...s, reply_text: text, clear_pending: true, shipment_id: s.shipment_id || null } };"
+      },
+      "id": "d7e386d5-e681-4327-a5f2-c8daf66eaa36",
+      "name": "Build Customer Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4256,
+        -1360
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wismo.conversation_state (customer_id, channel, pending_action, pending_context, last_message_id, updated_at)\nVALUES ($1, $2, $3, $4, $5, NOW())\nON CONFLICT (customer_id, channel) DO UPDATE\nSET pending_action = EXCLUDED.pending_action,\n    pending_context = EXCLUDED.pending_context,\n    last_message_id = EXCLUDED.last_message_id,\n    updated_at = NOW();\n\nSELECT $6::text AS reply_text, $2::text AS channel, $7::text AS customer_external_id, $8::uuid AS shipment_id, $5::text AS message_id;",
+        "options": {
+          "queryReplacement": "={{ [\n  $json.customer_id,\n  $json.channel,\n  $json.clear_pending ? null : ($json.set_pending || null),\n  $json.clear_pending ? null : ($json.pending_context || null),\n  $json.message_id,\n  $json.reply_text,\n  $json.customer_external_id,\n  $json.shipment_id || null\n] }}"
+        }
+      },
+      "id": "4b5cf974-c9ae-4c76-b1bc-302d959418b0",
+      "name": "Update Conversation State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        4496,
+        -1280
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "whatsapp",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "instagram",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "bab13965-7cce-42b3-b2a9-2b22065ef391",
+      "name": "Channel Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        4720,
+        -1280
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.facebook.com/v21.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID }}/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.META_SYSTEM_USER_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  messaging_product: 'whatsapp',\n  recipient_type: 'individual',\n  to: $json.customer_external_id,\n  type: 'text',\n  text: { body: $json.reply_text }\n}) }}",
+        "options": {}
+      },
+      "id": "046282c2-5fa8-43b3-b37e-dfb2c409e3d2",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4928,
+        -1360
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://graph.facebook.com/v21.0/me/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.INSTAGRAM_PAGE_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  recipient: { id: $json.customer_external_id },\n  message: { text: $json.reply_text }\n}) }}",
+        "options": {}
+      },
+      "id": "b21e1011-252c-499e-bdb3-ef6e6783b787",
+      "name": "Send Instagram Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4928,
+        -1200
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE wismo.idempotency_events\nSET status = 'completed', processed_at = NOW(), lease_until = NULL\nWHERE event_key = $1;",
+        "options": {
+          "queryReplacement": "={{ [$('Channel Router').item.json.channel + ':' + $('Channel Router').item.json.message_id] }}"
+        }
+      },
+      "id": "6c4e20a3-8d22-442f-b359-3e6652b9f3b1",
+      "name": "Mark Inbound Event Completed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        5168,
+        -1280
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO wismo.shipment_events (shipment_id, status, occurred_at, raw_payload)\nSELECT $1, 'reply_send_failed', NOW(), $2::jsonb\nWHERE $1 IS NOT NULL;\n\nUPDATE wismo.idempotency_events\nSET status = 'failed', lease_until = NULL\nWHERE event_key = $3;",
+        "options": {
+          "queryReplacement": "={{ [\n  $('Channel Router').item.json.shipment_id || null,\n  JSON.stringify($json),\n  $('Channel Router').item.json.channel + ':' + $('Channel Router').item.json.message_id\n] }}"
+        }
+      },
+      "id": "db954f14-e721-4985-98c9-59821d6461b0",
+      "name": "Log Send Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        5168,
+        -1120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "IhXIF8Pzx6HEDJWi",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.courier }}",
+                    "rightValue": "shiprocket",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.courier }}",
+                    "rightValue": "delhivery",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "21acc00a-ab97-42ee-a27a-906fb329e308",
+      "name": "Courier Router1",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        3136,
+        -1232
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://apiv2.shiprocket.in/v1/external/courier/track/awb/{{ $json.tracking_number }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.SHIPROCKET_JWT }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "c9355ad0-f4f9-42ab-922a-7ba69277ce0d",
+      "name": "Shiprocket Adapter1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        -1344
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://track.delhivery.com/api/v1/packages/json/?token={{ $env.DELHIVERY_AUTH_TOKEN }}&waybill={{ $json.tracking_number }}&verbose=2",
+        "options": {
+          "timeout": 5000
+        }
+      },
+      "id": "d0ed6019-5bc9-4c8f-bd81-583d228133e8",
+      "name": "Delhivery Adapter1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        -1216
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Inspect Shipment Details').item.json;\nconst map = {\n  '6': 'in_transit', '7': 'in_transit', '8': 'out_for_delivery',\n  '9': 'delivered', '10': 'delivery_exception', '11': 'delivery_exception',\n  '17': 'rto', '18': 'rto', 'SHIPPED': 'in_transit', 'DELIVERED': 'delivered'\n};\n\nconst track = $json.tracking_data?.shipment_track?.[0] || {};\nconst rawCode = String(track.current_status_code || track.current_status || '').trim();\nconst mapped = rawCode ? (map[rawCode] || 'unknown') : 'unknown';\nconst normalized = mapped !== 'unknown' ? mapped : (prev.normalized_status || 'unknown');\n\nconst lastScan = track.scans?.slice(-1)[0]?.location || prev.current_location || null;\nconst edd = track.edd ? String(track.edd).split(' ')[0] : prev.estimated_delivery || null;\nconst verifiedUrl = track.tracking_url || prev.tracking_url || null;\n\nreturn {\n  json: {\n    shipment_id: prev.shipment_id,\n    order_id: prev.order_id,\n    customer_id: prev.customer_id,\n    order_number: prev.order_number,\n    courier: 'shiprocket',\n    tracking_number: prev.tracking_number,\n    normalized_status: normalized,\n    raw_status: track.current_status || prev.raw_status || 'UNKNOWN',\n    current_location: lastScan,\n    estimated_delivery: edd,\n    tracking_url: verifiedUrl,\n    synced_at: new Date().toISOString()\n  }\n};"
+      },
+      "id": "248178ee-edf8-43b4-9853-3db26e4afcb2",
+      "name": "Normalize Shiprocket Response1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        -1344
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const prev = $('Inspect Shipment Details').item.json;\nconst map = {\n  'in transit': 'in_transit', 'dispatched': 'in_transit', 'out for delivery': 'out_for_delivery',\n  'delivered': 'delivered', 'pending': 'delivery_exception', 'failed': 'delivery_exception',\n  'consignee unreached': 'delivery_exception', 'rto': 'rto', 'returned': 'rto'\n};\n\nconst pkg = $json.ShipmentData?.[0]?.Shipment || {};\nconst rawStatus = (pkg.Status?.Status || '').toLowerCase().trim();\nconst mapped = rawStatus ? (map[rawStatus] || 'unknown') : 'unknown';\nconst normalized = mapped !== 'unknown' ? mapped : (prev.normalized_status || 'unknown');\n\nconst lastScan = pkg.Scans?.slice(-1)[0]?.ScanDetail?.ScannedLocation || prev.current_location || null;\nconst edd = pkg.Status?.ExpectedDeliveryDate ? String(pkg.Status.ExpectedDeliveryDate).split('T')[0] : prev.estimated_delivery || null;\nconst verifiedUrl = pkg.tracking_url || prev.tracking_url || null;\n\nreturn {\n  json: {\n    shipment_id: prev.shipment_id,\n    order_id: prev.order_id,\n    customer_id: prev.customer_id,\n    order_number: prev.order_number,\n    courier: 'delhivery',\n    tracking_number: prev.tracking_number,\n    normalized_status: normalized,\n    raw_status: pkg.Status?.Status || prev.raw_status || 'UNKNOWN',\n    current_location: lastScan,\n    estimated_delivery: edd,\n    tracking_url: verifiedUrl,\n    synced_at: new Date().toISOString()\n  }\n};"
+      },
+      "id": "6f5ee08d-9f52-4df0-80d5-44226877a49a",
+      "name": "Normalize Delhivery Response1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        -1216
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message_text }}",
+        "options": {
+          "systemMessage": "You are a specialized intent classification engine for retail D2C store logistics.\nParse the user's message and return ONLY a valid JSON object matching this exact schema:\n{\n  \"intent\": \"TRACK_ORDER\" | \"NON_TRACKING\" | \"UNCLEAR\",\n  \"order_number\": string or null,\n  \"tracking_number\": string or null,\n  \"confidence\": number\n}\n\nSTRICT RULES:\n1. TRACK_ORDER requires explicit tracking, shipment progress, dispatch, or arrival context (e.g., \"Where is my order?\", \"Has my saree shipped?\", \"When will my package arrive?\").\n2. Mentions of product categories alone (e.g., \"Do you have this saree in blue?\", \"Is this jewelry real gold?\") are NOT tracking. Classify as NON_TRACKING.\n3. General shipping policy questions (e.g., \"How much does shipping cost?\") are NON_TRACKING.\n4. Extract 4 to 6 digit order numbers into order_number.\n5. Extract courier AWB numbers into tracking_number.\n6. Never invent order numbers, AWBs, or tracking statuses.\n7. Return raw JSON only without markdown formatting, backticks, or preamble."
+        }
+      },
+      "id": "16885f4e-9d9c-4d31-b255-eb2edc586a56",
+      "name": "AI Agent1",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        192,
+        -1056
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        48,
+        -928
+      ],
+      "id": "ca5e4ed1-fbeb-4fdb-8d27-c1a1d1aeb4ba",
+      "name": "Google Gemini Chat Model1",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "jPMFKUNNYQDkw2Ie",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger (15 min)": {
+      "main": [
+        [
+          {
+            "node": "Claim Active Shipments Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Active Shipments Batch": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Shipments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Shipments": {
+      "main": [
+        [
+          {
+            "node": "Determine Courier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Determine Courier": {
+      "main": [
+        [
+          {
+            "node": "Courier Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Courier Router": {
+      "main": [
+        [
+          {
+            "node": "Shiprocket Adapter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Delhivery Adapter",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unsupported Courier Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shiprocket Adapter": {
+      "main": [
+        [
+          {
+            "node": "Normalize Shiprocket Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Courier Sync Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delhivery Adapter": {
+      "main": [
+        [
+          {
+            "node": "Normalize Delhivery Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Courier Sync Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unsupported Courier Handler": {
+      "main": [
+        [
+          {
+            "node": "Log Unsupported Courier & Release Lease",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Unsupported Courier & Release Lease": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Shipments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Courier Sync Failure": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Shipments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Shiprocket Response": {
+      "main": [
+        [
+          {
+            "node": "Compare With Previous State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Delhivery Response": {
+      "main": [
+        [
+          {
+            "node": "Compare With Previous State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compare With Previous State": {
+      "main": [
+        [
+          {
+            "node": "Status Changed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Status Changed?": {
+      "main": [
+        [
+          {
+            "node": "Atomic Update Shipment & Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Touch Last Synced (No Change)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Touch Last Synced (No Change)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Shipments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Atomic Update Shipment & Event": {
+      "main": [
+        [
+          {
+            "node": "Important Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Important Event?": {
+      "main": [
+        [
+          {
+            "node": "Claim Notification Lock & Eligibility",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Shipments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Notification Lock & Eligibility": {
+      "main": [
+        [
+          {
+            "node": "Notification Eligible & New?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notification Eligible & New?": {
+      "main": [
+        [
+          {
+            "node": "Build Proactive Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Shipments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Proactive Notification": {
+      "main": [
+        [
+          {
+            "node": "Send Customer Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Customer Notification": {
+      "main": [
+        [
+          {
+            "node": "Mark Notification Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Notification Send Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Notification Sent": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Shipments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Notification Send Failure": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Shipments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger (Retry Due Notifications)": {
+      "main": [
+        [
+          {
+            "node": "Claim Due Notifications Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Due Notifications Batch": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Notifications": {
+      "main": [
+        [
+          {
+            "node": "Check Notification Superseded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Notification Superseded": {
+      "main": [
+        [
+          {
+            "node": "Notification Milestone Still Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notification Milestone Still Valid?": {
+      "main": [
+        [
+          {
+            "node": "Build Proactive Notification (Retry)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Notification Superseded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Notification Superseded": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Proactive Notification (Retry)": {
+      "main": [
+        [
+          {
+            "node": "Send Customer Notification (Retry)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Customer Notification (Retry)": {
+      "main": [
+        [
+          {
+            "node": "Mark Notification Sent (Retry)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Notification Send Failure (Retry)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Notification Sent (Retry)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Notification Send Failure (Retry)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp Webhook (POST)": {
+      "main": [
+        [
+          {
+            "node": "Verify WhatsApp Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp Webhook (GET Challenge)": {
+      "main": [
+        [
+          {
+            "node": "Handle Meta Webhook Challenge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Instagram Webhook (POST)": {
+      "main": [
+        [
+          {
+            "node": "Verify Instagram Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Instagram Webhook (GET Challenge)": {
+      "main": [
+        [
+          {
+            "node": "Handle Meta Webhook Challenge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger (Reap Abandoned Inbound Events)": {
+      "main": [
+        [
+          {
+            "node": "Reclaim Abandoned Inbound Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reclaim Abandoned Inbound Events": {
+      "main": [
+        [
+          {
+            "node": "Identify Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Meta Webhook Challenge": {
+      "main": [
+        [
+          {
+            "node": "Challenge Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Challenge Valid?": {
+      "main": [
+        [
+          {
+            "node": "Respond Meta Challenge (200)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject Challenge (403)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify WhatsApp Signature": {
+      "main": [
+        [
+          {
+            "node": "Signature Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Instagram Signature": {
+      "main": [
+        [
+          {
+            "node": "Signature Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature Valid?": {
+      "main": [
+        [
+          {
+            "node": "Normalize Incoming Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject (401)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Incoming Message": {
+      "main": [
+        [
+          {
+            "node": "Message Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message Valid?": {
+      "main": [
+        [
+          {
+            "node": "Idempotency Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject (400)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Idempotency Check": {
+      "main": [
+        [
+          {
+            "node": "New Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Message?": {
+      "main": [
+        [
+          {
+            "node": "Respond 200 (ACK)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 200 (Duplicate)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond 200 (ACK)": {
+      "main": [
+        [
+          {
+            "node": "Identify Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Identify Customer": {
+      "main": [
+        [
+          {
+            "node": "Customer Known?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Customer Known?": {
+      "main": [
+        [
+          {
+            "node": "Load Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Unknown-Sender Refusal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Unknown-Sender Refusal": {
+      "main": [
+        [
+          {
+            "node": "Channel Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Conversation State": {
+      "main": [
+        [
+          {
+            "node": "Has Pending Action?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Pending Action?": {
+      "main": [
+        [
+          {
+            "node": "Resolve Pending Action",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Pending Action": {
+      "main": [
+        [
+          {
+            "node": "Pending Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pending Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Direct Shipment Selection?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Direct Shipment Selection?": {
+      "main": [
+        [
+          {
+            "node": "Retrieve Exact Shipment Info",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find Relevant Order(s)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retrieve Exact Shipment Info": {
+      "main": [
+        [
+          {
+            "node": "Inspect Shipment Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate AI Output": {
+      "main": [
+        [
+          {
+            "node": "Intent Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Intent Router": {
+      "main": [
+        [
+          {
+            "node": "Find Relevant Order(s)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Non-Tracking Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unclear Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Non-Tracking Reply": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unclear Reply": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Relevant Order(s)": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Orders Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Orders Found": {
+      "main": [
+        [
+          {
+            "node": "Order Count?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Order Count?": {
+      "main": [
+        [
+          {
+            "node": "Ask For Order Number",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retrieve Shipments for Order",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ask Customer To Select Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask For Order Number": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask Customer To Select Order": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retrieve Shipments for Order": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Shipments Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Shipments Found": {
+      "main": [
+        [
+          {
+            "node": "Shipment Count?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shipment Count?": {
+      "main": [
+        [
+          {
+            "node": "Reply: Not Yet Shipped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Inspect Shipment Details",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ask Customer To Select Shipment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ask Customer To Select Shipment": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inspect Shipment Details": {
+      "main": [
+        [
+          {
+            "node": "Exact Shipment Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Exact Shipment Found?": {
+      "main": [
+        [
+          {
+            "node": "No Tracking Number Yet?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No Tracking Number Yet?": {
+      "main": [
+        [
+          {
+            "node": "Reply: Not Yet Shipped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Needs Live Call?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reply: Not Yet Shipped": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Live Call?": {
+      "main": [
+        [
+          {
+            "node": "Courier Router1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Apply Business Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Courier API Failure Handler": {
+      "main": [
+        [
+          {
+            "node": "Record Courier API Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Courier API Failure": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unsupported Courier -> Fallback": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Business Rules": {
+      "main": [
+        [
+          {
+            "node": "Escalation Needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalation Needed?": {
+      "main": [
+        [
+          {
+            "node": "Escalation Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Customer Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalation Reply": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Customer Response": {
+      "main": [
+        [
+          {
+            "node": "Update Conversation State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Conversation State": {
+      "main": [
+        [
+          {
+            "node": "Channel Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Channel Router": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Instagram Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Reply": {
+      "main": [
+        [
+          {
+            "node": "Mark Inbound Event Completed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Send Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Instagram Reply": {
+      "main": [
+        [
+          {
+            "node": "Mark Inbound Event Completed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Send Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Courier Router1": {
+      "main": [
+        [
+          {
+            "node": "Shiprocket Adapter1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Delhivery Adapter1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unsupported Courier -> Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shiprocket Adapter1": {
+      "main": [
+        [
+          {
+            "node": "Normalize Shiprocket Response1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Courier API Failure Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delhivery Adapter1": {
+      "main": [
+        [
+          {
+            "node": "Normalize Delhivery Response1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Courier API Failure Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Shiprocket Response1": {
+      "main": [
+        [
+          {
+            "node": "Apply Business Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Delhivery Response1": {
+      "main": [
+        [
+          {
+            "node": "Apply Business Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent1": {
+      "main": [
+        [
+          {
+            "node": "Validate AI Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "ee78322f-76d4-49cd-b88e-6d540dd3a040",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ab782a197a34b627a970462134e9e8786494badc720390c65408c52487825c6c"
+  },
+  "nodeGroups": [],
+  "id": "B9bVuomvCMVOb0gN",
+  "tags": []
+}
